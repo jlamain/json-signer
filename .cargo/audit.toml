@@ -1,0 +1,3 @@
+[advisories]
+# Local CLI tool, not network-exposed, risk accepted. Migrate to newer rsa crate when constant-time fixes are ready
+ignore = ["RUSTSEC-2023-0071"] 
