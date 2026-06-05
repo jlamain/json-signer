@@ -96,7 +96,7 @@ enum Command {
 // Key generation and export functions. Keys are generated as RSA-2048, exported in PKCS#8 (private)
 // and SubjectPublicKeyInfo (public) DER format, then PEM-encoded for storage.
 
-fn generate_keys(private_key_path: &PathBuf, public_key_path: &PathBuf) -> Result<()> {
+fn generate_keys(private_key_path: &Path, public_key_path: &Path) -> Result<()> {
     let private_key = RsaPrivateKey::new(&mut OsRng, 2048).context("Key generation failed")?;
     let public_key = RsaPublicKey::from(&private_key);
 
@@ -263,6 +263,34 @@ fn load_and_verify_json(json_path: &PathBuf, public_key_path: &PathBuf) -> Resul
         println!("Signature INVALID ✗  — config may have been tampered with!");
     }
     Ok(verification_result)
+}
+
+/// Main entry point: parse CLI args and dispatch to the appropriate command handler.
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match &cli.command {
+        Command::GenerateKeys {
+            private_key,
+            public_key,
+        } => {
+            generate_keys(private_key, public_key)?;
+        }
+        Command::Sign {
+            config,
+            private_key,
+            key_id,
+        } => {
+            sign_json(config, private_key, key_id)?;
+        }
+        Command::Verify { config, public_key } => {
+            let valid = load_and_verify_json(config, public_key)?;
+            if !valid {
+                std::process::exit(1);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -786,32 +814,4 @@ mod tests {
         let _ = fs::remove_file(&json_path);
         let _ = fs::remove_file(&pub_path);
     }
-}
-
-/// Main entry point: parse CLI args and dispatch to the appropriate command handler.
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match &cli.command {
-        Command::GenerateKeys {
-            private_key,
-            public_key,
-        } => {
-            generate_keys(private_key, public_key)?;
-        }
-        Command::Sign {
-            config,
-            private_key,
-            key_id,
-        } => {
-            sign_json(config, private_key, key_id)?;
-        }
-        Command::Verify { config, public_key } => {
-            let valid = load_and_verify_json(config, public_key)?;
-            if !valid {
-                std::process::exit(1);
-            }
-        }
-    }
-    Ok(())
 }
