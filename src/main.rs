@@ -150,6 +150,19 @@ fn write_private_key_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     fs::write(path, contents)
 }
 
+/// Write `contents` to `path` atomically: write a sibling temp file, then rename it
+/// over the target, so a crash mid-write cannot leave a truncated file behind.
+fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
 /// Load an RSA private key from a PKCS#8 PEM file.
 fn load_private_key(path: &Path) -> Result<RsaPrivateKey> {
     let pem_data =
@@ -221,7 +234,7 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
 
     let output =
         serde_json::to_string_pretty(&Value::Object(json)).context("Serialization failed")?;
-    fs::write(json_path, output)
+    write_atomic(json_path, &output)
         .with_context(|| format!("Cannot write {}", json_path.display()))?;
 
     println!("Config signed successfully: {}", json_path.display());
@@ -688,6 +701,10 @@ mod tests {
 
         sign_json(&json_path, &priv_path, "rt-key").unwrap();
         assert!(load_and_verify_json(&json_path, &pub_path).unwrap());
+        assert!(
+            !temp_path("sign_rt.json.tmp").exists(),
+            "atomic write must not leave a temp file behind"
+        );
 
         let signed: Value = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
         assert_eq!(signed[SIGNATURE_FIELD]["kid"], json!("rt-key"));
