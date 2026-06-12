@@ -102,6 +102,7 @@ Keep `private.pem` secret. Distribute `public.pem` to any system that needs to v
 - `generate-keys` never overwrites existing files, so a key pair cannot be destroyed by re-running the command.
 - The verifier uses the public key passed with `--public-key`; it does not perform key lookup from `kid`.
 - The `alg`, `kid`, and `signed_at` fields are covered by the signature and cannot be altered after signing. They are still not *checked* by the verifier (no key lookup, no freshness check): in particular, an old config with a valid signature verifies forever, so rotate keys if a signed config must be revoked.
+- PKCS#1 v1.5 signatures are deterministic and remain considered secure, but RSA-PSS (or Ed25519) is the modern recommendation; consider it for a future format revision.
 - The project uses the RustCrypto `rsa` crate. `.cargo/audit.toml` currently ignores `RUSTSEC-2023-0071` because this is intended as a local CLI tool, not a network-exposed signing service. Revisit that exception before using this code in any service where attackers can trigger signing or observe timing.
 
 ## Cryptographic Details

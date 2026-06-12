@@ -128,11 +128,6 @@ fn generate_keys(private_key_path: &Path, public_key_path: &Path) -> Result<()> 
     fs::write(public_key_path, &public_pem)
         .with_context(|| format!("Cannot write {}", public_key_path.display()))?;
 
-    println!(
-        "Keys written to: {}  {}",
-        private_key_path.display(),
-        public_key_path.display()
-    );
     Ok(())
 }
 
@@ -318,10 +313,6 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
         .with_context(|| format!("Cannot read {}", json_path.display()))?;
     let mut json = parse_json_object(&raw)?;
 
-    if json.contains_key(SIGNATURE_FIELD) {
-        println!("Existing signature found — replacing it.");
-    }
-
     let private_key = load_private_key(private_key_path)?;
     embed_signature(&mut json, private_key, key_id, &Utc::now().to_rfc3339())?;
 
@@ -330,7 +321,6 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
     write_atomic(json_path, &output)
         .with_context(|| format!("Cannot write {}", json_path.display()))?;
 
-    println!("Config signed successfully: {}", json_path.display());
     Ok(())
 }
 
@@ -374,14 +364,7 @@ fn load_and_verify_json(json_path: &Path, public_key_path: &Path) -> Result<bool
 
     let public_key = load_public_key(public_key_path)?;
 
-    let verification_result = verify_json(&json, public_key)?;
-
-    if verification_result {
-        println!("Signature VALID  ✓");
-    } else {
-        println!("Signature INVALID ✗  — config may have been tampered with!");
-    }
-    Ok(verification_result)
+    verify_json(&json, public_key)
 }
 
 /// Main entry point: parse CLI args and dispatch to the appropriate command handler.
@@ -394,6 +377,11 @@ fn main() -> Result<()> {
             public_key,
         } => {
             generate_keys(private_key, public_key)?;
+            println!(
+                "Keys written to: {}  {}",
+                private_key.display(),
+                public_key.display()
+            );
         }
         Command::Sign {
             config,
@@ -401,10 +389,13 @@ fn main() -> Result<()> {
             key_id,
         } => {
             sign_json(config, private_key, key_id)?;
+            println!("Config signed successfully: {}", config.display());
         }
         Command::Verify { config, public_key } => {
-            let valid = load_and_verify_json(config, public_key)?;
-            if !valid {
+            if load_and_verify_json(config, public_key)? {
+                println!("Signature VALID  ✓");
+            } else {
+                println!("Signature INVALID ✗  — config may have been tampered with!");
                 std::process::exit(1);
             }
         }
