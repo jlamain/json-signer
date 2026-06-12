@@ -2,6 +2,8 @@
 //!
 //! Signs and verifies JSON config files using RSA-2048 + PKCS#1v15 + SHA-256,
 //! with an embedded `_signature` field. Canonical JSON per RFC 8785 (JCS).
+//! The signature covers the whole document including the `alg`/`kid`/`signed_at`
+//! metadata; only the `sig` value itself is excluded.
 //!
 use std::{
     fs,
@@ -268,14 +270,22 @@ fn load_public_key(path: &Path) -> Result<RsaPublicKey> {
 }
 
 /// Sign the canonical form of `json` and insert the resulting `_signature` block,
-/// replacing any existing one.
+/// replacing any existing one. The `alg`/`kid`/`signed_at` metadata is inserted
+/// before signing, so it is covered by the signature; only `sig` itself is not.
 fn embed_signature(
     json: &mut Map<String, Value>,
     private_key: RsaPrivateKey,
     key_id: &str,
     signed_at: &str,
 ) -> Result<()> {
-    json.remove(SIGNATURE_FIELD);
+    json.insert(
+        SIGNATURE_FIELD.into(),
+        serde_json::json!({
+            "alg":       "RS256",
+            "kid":       key_id,
+            "signed_at": signed_at,
+        }),
+    );
     let payload = canonicalize(json)?;
 
     let signing_key = SigningKey::<Sha256>::new(private_key);
@@ -283,26 +293,22 @@ fn embed_signature(
     let sig: rsa::pkcs1v15::Signature = signing_key.sign(&payload);
     let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes().as_ref());
 
-    json.insert(
-        SIGNATURE_FIELD.into(),
-        serde_json::json!({
-            "alg":       "RS256",
-            "kid":       key_id,
-            "signed_at": signed_at,
-            "sig":       sig_b64,
-        }),
-    );
+    let Some(Value::Object(sig_block)) = json.get_mut(SIGNATURE_FIELD) else {
+        unreachable!("signature block was just inserted as an object");
+    };
+    sig_block.insert("sig".into(), Value::String(sig_b64));
     Ok(())
 }
 
-/// Return the canonical JSON bytes of Map `m`, with `_signature` stripped.
+/// Return the canonical JSON bytes of Map `m`, with only the `sig` value removed
+/// from the `_signature` block. Everything else — payload and signature metadata —
+/// is part of the signed bytes.
 fn canonicalize(m: &Map<String, Value>) -> Result<Vec<u8>> {
-    let without_sig: Map<String, Value> = m
-        .iter()
-        .filter(|(k, _)| k.as_str() != SIGNATURE_FIELD)
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    Ok(json_canon::to_string(&Value::Object(without_sig))?.into_bytes())
+    let mut m = m.clone();
+    if let Some(Value::Object(sig_block)) = m.get_mut(SIGNATURE_FIELD) {
+        sig_block.remove("sig");
+    }
+    Ok(json_canon::to_string(&Value::Object(m))?.into_bytes())
 }
 
 /// Sign the json file at `json_path` using the RSA private key at `private_key_path`, embedding the signature in the `_signature` field.
@@ -328,13 +334,17 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
     Ok(())
 }
 
-/// Verify the signature in `sig_block` against the canonical JSON payload (without _signature)
-/// using the provided RSA public key.
-fn verify_json(
-    json: &Map<String, Value>,
-    public_key: RsaPublicKey,
-    sig_block: &Map<String, Value>,
-) -> Result<bool> {
+/// Verify the embedded `_signature` against the canonical form of `json` (everything
+/// except the `sig` value itself, so the `alg`/`kid`/`signed_at` metadata is covered).
+///
+/// Returns `Ok(false)` for a well-formed signature that does not match, and `Err` for
+/// structurally invalid input: missing or non-object `_signature`, missing `sig`,
+/// bad base64, or a signature with an impossible length.
+fn verify_json(json: &Map<String, Value>, public_key: RsaPublicKey) -> Result<bool> {
+    let Some(sig_block) = json.get(SIGNATURE_FIELD).and_then(|v| v.as_object()) else {
+        bail!("No '{SIGNATURE_FIELD}' object found in config");
+    };
+
     let sig_b64 = sig_block
         .get("sig")
         .and_then(|v| v.as_str())
@@ -344,7 +354,6 @@ fn verify_json(
         .decode(sig_b64)
         .context("Failed to base64-decode signature")?;
 
-    // Canonicalize payload (without _signature)
     let payload = canonicalize(json)?;
 
     let verifying_key = VerifyingKey::<Sha256>::new(public_key);
@@ -365,11 +374,7 @@ fn load_and_verify_json(json_path: &Path, public_key_path: &Path) -> Result<bool
 
     let public_key = load_public_key(public_key_path)?;
 
-    let Some(sig_block) = json.get(SIGNATURE_FIELD).and_then(|v| v.as_object()) else {
-        bail!("No '{SIGNATURE_FIELD}' field found in config");
-    };
-
-    let verification_result = verify_json(&json, public_key, sig_block)?;
+    let verification_result = verify_json(&json, public_key)?;
 
     if verification_result {
         println!("Signature VALID  ✓");
@@ -418,7 +423,7 @@ mod tests {
         RsaPrivateKey, RsaPublicKey,
     };
     use serde_json::{json, Map, Value};
-    use signature::{SignatureEncoding, Signer, Verifier};
+    use signature::{Signer, Verifier};
     use spki::EncodePublicKey;
     use std::{fs, path::PathBuf};
 
@@ -427,12 +432,6 @@ mod tests {
         let priv_key = RsaPrivateKey::new(&mut OsRng, 1024).unwrap();
         let pub_key = RsaPublicKey::from(&priv_key);
         (priv_key, pub_key)
-    }
-
-    fn sign_bytes(payload: &[u8], priv_key: RsaPrivateKey) -> String {
-        let signing_key = SigningKey::<sha2::Sha256>::new(priv_key);
-        let sig: rsa::pkcs1v15::Signature = signing_key.sign(payload);
-        URL_SAFE_NO_PAD.encode(sig.to_bytes().as_ref())
     }
 
     fn canonicalize_ok(m: &Map<String, Value>) -> Vec<u8> {
@@ -447,12 +446,19 @@ mod tests {
         m
     }
 
-    fn make_sig_block(sig_b64: &str) -> Map<String, Value> {
-        let mut sb = Map::new();
-        sb.insert("alg".into(), json!("RS256"));
-        sb.insert("kid".into(), json!("test-key"));
-        sb.insert("sig".into(), json!(sig_b64));
-        sb
+    // Return a copy of `payload` signed with fixed metadata, via the real signing path.
+    fn signed_map(priv_key: RsaPrivateKey, payload: &Map<String, Value>) -> Map<String, Value> {
+        let mut m = payload.clone();
+        embed_signature(&mut m, priv_key, "test-key", "2024-01-01T00:00:00Z").unwrap();
+        m
+    }
+
+    // Overwrite one field of the `_signature` block after signing.
+    fn tamper_sig_block(m: &mut Map<String, Value>, field: &str, value: Value) {
+        m.get_mut(SIGNATURE_FIELD)
+            .and_then(Value::as_object_mut)
+            .unwrap()
+            .insert(field.to_string(), value);
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -491,18 +497,24 @@ mod tests {
     }
 
     #[test]
-    fn test_canonicalize_only_signature_field_gives_empty_object() {
+    fn test_canonicalize_strips_sig_but_keeps_signature_metadata() {
         let m = make_map(&[(SIGNATURE_FIELD, json!({"sig": "abc", "alg": "RS256"}))]);
-        assert_eq!(canonicalize_ok(&m), b"{}");
+        assert_eq!(
+            String::from_utf8(canonicalize_ok(&m)).unwrap(),
+            r#"{"_signature":{"alg":"RS256"}}"#
+        );
     }
 
     #[test]
-    fn test_canonicalize_strips_signature_keeps_other_fields() {
+    fn test_canonicalize_keeps_other_fields() {
         let m = make_map(&[
             ("foo", json!("bar")),
             (SIGNATURE_FIELD, json!({"sig": "abc"})),
         ]);
-        assert_eq!(canonicalize_ok(&m), br#"{"foo":"bar"}"#);
+        assert_eq!(
+            String::from_utf8(canonicalize_ok(&m)).unwrap(),
+            r#"{"_signature":{},"foo":"bar"}"#
+        );
     }
 
     #[test]
@@ -570,103 +582,111 @@ mod tests {
     #[test]
     fn test_verify_json_valid_signature_returns_true() {
         let (priv_key, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("env", json!("prod")), ("v", json!(2))]);
-        let canonical = canonicalize_ok(&payload);
-        let sig_b64 = sign_bytes(&canonical, priv_key);
-        let sig_block = make_sig_block(&sig_b64);
+        let signed = signed_map(
+            priv_key,
+            &make_map(&[("env", json!("prod")), ("v", json!(2))]),
+        );
 
-        let mut full = payload.clone();
-        full.insert(SIGNATURE_FIELD.into(), Value::Object(sig_block.clone()));
-
-        assert!(verify_json(&full, pub_key, &sig_block).unwrap());
+        assert!(verify_json(&signed, pub_key).unwrap());
     }
 
     #[test]
     fn test_verify_json_tampered_value_returns_false() {
         let (priv_key, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("env", json!("prod"))]);
-        let sig_b64 = sign_bytes(&canonicalize_ok(&payload), priv_key);
-        let sig_block = make_sig_block(&sig_b64);
+        let mut signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
 
         // Change "prod" → "dev" after signing
-        let mut tampered = make_map(&[("env", json!("dev"))]);
-        tampered.insert(SIGNATURE_FIELD.into(), Value::Object(sig_block.clone()));
+        signed.insert("env".into(), json!("dev"));
 
-        assert!(!verify_json(&tampered, pub_key, &sig_block).unwrap());
+        assert!(!verify_json(&signed, pub_key).unwrap());
     }
 
     #[test]
     fn test_verify_json_injected_field_returns_false() {
         let (priv_key, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("env", json!("prod"))]);
-        let sig_b64 = sign_bytes(&canonicalize_ok(&payload), priv_key);
-        let sig_block = make_sig_block(&sig_b64);
+        let mut signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
 
-        let mut tampered = payload.clone();
-        tampered.insert("injected".into(), json!("evil"));
-        tampered.insert(SIGNATURE_FIELD.into(), Value::Object(sig_block.clone()));
+        signed.insert("injected".into(), json!("evil"));
 
-        assert!(!verify_json(&tampered, pub_key, &sig_block).unwrap());
+        assert!(!verify_json(&signed, pub_key).unwrap());
     }
 
     #[test]
     fn test_verify_json_removed_field_returns_false() {
         let (priv_key, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("a", json!(1)), ("b", json!(2))]);
-        let sig_b64 = sign_bytes(&canonicalize_ok(&payload), priv_key);
-        let sig_block = make_sig_block(&sig_b64);
+        let mut signed = signed_map(priv_key, &make_map(&[("a", json!(1)), ("b", json!(2))]));
 
-        // Remove "b" after signing
-        let mut tampered = make_map(&[("a", json!(1))]);
-        tampered.insert(SIGNATURE_FIELD.into(), Value::Object(sig_block.clone()));
+        signed.remove("b");
 
-        assert!(!verify_json(&tampered, pub_key, &sig_block).unwrap());
+        assert!(!verify_json(&signed, pub_key).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_tampered_kid_returns_false() {
+        let (priv_key, pub_key) = make_test_key_pair();
+        let mut signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
+
+        tamper_sig_block(&mut signed, "kid", json!("other-key"));
+
+        assert!(!verify_json(&signed, pub_key).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_tampered_signed_at_returns_false() {
+        let (priv_key, pub_key) = make_test_key_pair();
+        let mut signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
+
+        tamper_sig_block(&mut signed, "signed_at", json!("2030-01-01T00:00:00Z"));
+
+        assert!(!verify_json(&signed, pub_key).unwrap());
     }
 
     #[test]
     fn test_verify_json_wrong_key_returns_false() {
         let (priv_key, _) = make_test_key_pair();
         let (_, other_pub) = make_test_key_pair();
+        let signed = signed_map(priv_key, &make_map(&[("x", json!(1))]));
+
+        assert!(!verify_json(&signed, other_pub).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_missing_signature_block_is_error() {
+        let (_, pub_key) = make_test_key_pair();
         let payload = make_map(&[("x", json!(1))]);
-        let sig_b64 = sign_bytes(&canonicalize_ok(&payload), priv_key);
-        let sig_block = make_sig_block(&sig_b64);
 
-        let mut full = payload.clone();
-        full.insert(SIGNATURE_FIELD.into(), Value::Object(sig_block.clone()));
-
-        assert!(!verify_json(&full, other_pub, &sig_block).unwrap());
+        let err = verify_json(&payload, pub_key).unwrap_err();
+        assert!(err.to_string().contains(SIGNATURE_FIELD));
     }
 
     #[test]
     fn test_verify_json_missing_sig_field_is_error() {
         let (_, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("x", json!(1))]);
-        let empty_sig_block = Map::new(); // no "sig" key
+        let mut payload = make_map(&[("x", json!(1))]);
+        payload.insert(SIGNATURE_FIELD.into(), json!({"alg": "RS256"})); // no "sig" key
 
-        let err = verify_json(&payload, pub_key, &empty_sig_block).unwrap_err();
+        let err = verify_json(&payload, pub_key).unwrap_err();
         assert!(err.to_string().contains("sig"));
     }
 
     #[test]
     fn test_verify_json_invalid_base64_is_error() {
         let (_, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("x", json!(1))]);
-        let mut sig_block = Map::new();
-        sig_block.insert("sig".into(), json!("!!!not-base64!!!"));
+        let mut payload = make_map(&[("x", json!(1))]);
+        payload.insert(SIGNATURE_FIELD.into(), json!({"sig": "!!!not-base64!!!"}));
 
-        assert!(verify_json(&payload, pub_key, &sig_block).is_err());
+        assert!(verify_json(&payload, pub_key).is_err());
     }
 
     #[test]
     fn test_verify_json_truncated_signature_does_not_verify() {
         let (_, pub_key) = make_test_key_pair();
-        let payload = make_map(&[("x", json!(1))]);
+        let mut payload = make_map(&[("x", json!(1))]);
         // Valid base64, but far too few bytes to be a valid RSA-1024 signature (128 bytes).
         let bad_sig = URL_SAFE_NO_PAD.encode(b"way_too_short");
-        let mut sig_block = Map::new();
-        sig_block.insert("sig".into(), json!(bad_sig));
+        payload.insert(SIGNATURE_FIELD.into(), json!({ "sig": bad_sig }));
 
-        match verify_json(&payload, pub_key, &sig_block) {
+        match verify_json(&payload, pub_key) {
             Ok(false) | Err(_) => {} // invalid bytes must not produce Ok(true)
             Ok(true) => panic!("truncated signature must not verify"),
         }
@@ -675,11 +695,9 @@ mod tests {
     #[test]
     fn test_verify_json_empty_payload_with_valid_sig_returns_true() {
         let (priv_key, pub_key) = make_test_key_pair();
-        let payload = Map::new();
-        let sig_b64 = sign_bytes(&canonicalize_ok(&payload), priv_key);
-        let sig_block = make_sig_block(&sig_b64);
+        let signed = signed_map(priv_key, &Map::new());
 
-        assert!(verify_json(&payload, pub_key, &sig_block).unwrap());
+        assert!(verify_json(&signed, pub_key).unwrap());
     }
 
     /// `generate_keys` tests

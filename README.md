@@ -4,7 +4,7 @@ A CLI tool for signing and verifying JSON configuration files using RSA-2048 / P
 
 ## How It Works
 
-When signing, the tool removes any existing `_signature` field, serializes the remaining top-level JSON object as canonical JSON, signs those bytes, and writes a new `_signature` block back into the file:
+When signing, the tool replaces any existing `_signature` field with a fresh metadata block (`alg`, `kid`, `signed_at`), serializes the whole document as canonical JSON, signs those bytes, and adds the resulting `sig` value to the block. The signature therefore covers the payload *and* the signature metadata; only the `sig` value itself is excluded:
 
 ```json
 {
@@ -19,7 +19,9 @@ When signing, the tool removes any existing `_signature` field, serializes the r
 }
 ```
 
-Verification re-canonicalizes the payload, again excluding `_signature`, and checks the embedded `sig` value against the provided public key. The process exits with code `0` on a valid signature and code `1` on an invalid signature or other error.
+Verification re-canonicalizes the document, again excluding only the `sig` value, and checks the embedded signature against the provided public key. Tampering with `alg`, `kid`, or `signed_at` invalidates the signature just like tampering with the payload. The process exits with code `0` on a valid signature and code `1` on an invalid signature or other error.
+
+Input containing duplicate object keys (at any nesting level) is rejected by both `sign` and `verify`: different JSON parsers disagree about which duplicate wins, which would let a verified file mean different things to different consumers.
 
 Canonicalization errors are reported instead of panicking. For example, inputs that are valid JSON but cannot be represented under the canonicalization rules, such as integers outside the JSON safe-integer range, fail cleanly.
 
@@ -99,7 +101,7 @@ Keep `private.pem` secret. Distribute `public.pem` to any system that needs to v
 - On Unix, generated private keys are written with `0600` permissions. On non-Unix platforms, protect private keys with the host operating system's file access controls.
 - `generate-keys` never overwrites existing files, so a key pair cannot be destroyed by re-running the command.
 - The verifier uses the public key passed with `--public-key`; it does not perform key lookup from `kid`.
-- The `_signature.sig` field is the value that is verified. Treat `alg`, `kid`, and `signed_at` as metadata, not authorization decisions.
+- The `alg`, `kid`, and `signed_at` fields are covered by the signature and cannot be altered after signing. They are still not *checked* by the verifier (no key lookup, no freshness check): in particular, an old config with a valid signature verifies forever, so rotate keys if a signed config must be revoked.
 - The project uses the RustCrypto `rsa` crate. `.cargo/audit.toml` currently ignores `RUSTSEC-2023-0071` because this is intended as a local CLI tool, not a network-exposed signing service. Revisit that exception before using this code in any service where attackers can trigger signing or observe timing.
 
 ## Cryptographic Details
