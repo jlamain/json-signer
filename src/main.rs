@@ -97,6 +97,16 @@ enum Command {
 // and SubjectPublicKeyInfo (public) DER format, then PEM-encoded for storage.
 
 fn generate_keys(private_key_path: &Path, public_key_path: &Path) -> Result<()> {
+    // Never clobber existing key material; a lost private key is unrecoverable.
+    for path in [private_key_path, public_key_path] {
+        if path.exists() {
+            bail!(
+                "Refusing to overwrite existing file {} — move it away or pass a different path",
+                path.display()
+            );
+        }
+    }
+
     let private_key = RsaPrivateKey::new(&mut OsRng, 2048).context("Key generation failed")?;
     let public_key = RsaPublicKey::from(&private_key);
 
@@ -136,8 +146,7 @@ fn write_private_key_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
 
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)?;
 
@@ -147,7 +156,13 @@ fn write_private_key_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
 
 #[cfg(not(unix))]
 fn write_private_key_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    fs::write(path, contents)
+    use std::io::Write;
+
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    file.write_all(contents)
 }
 
 /// Write `contents` to `path` atomically: write a sibling temp file, then rename it
@@ -685,6 +700,28 @@ mod tests {
 
         assert!(result.is_err());
         let _ = fs::remove_file(&priv_path);
+    }
+
+    #[test]
+    fn test_generate_keys_refuses_to_overwrite_existing_files() {
+        let priv_path = temp_path("no_overwrite_priv.pem");
+        let pub_path = temp_path("no_overwrite_pub.pem");
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+
+        generate_keys(&priv_path, &pub_path).unwrap();
+        let original_priv = fs::read_to_string(&priv_path).unwrap();
+
+        let err = generate_keys(&priv_path, &pub_path).unwrap_err();
+        assert!(err.to_string().contains("Refusing to overwrite"));
+        assert_eq!(
+            fs::read_to_string(&priv_path).unwrap(),
+            original_priv,
+            "existing private key must be untouched"
+        );
+
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
     }
 
     /// `sign_json` tests

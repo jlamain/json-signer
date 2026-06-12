@@ -41,7 +41,7 @@ The binary is written to `target/release/json-signer`. The examples below assume
 json-signer generate-keys
 ```
 
-Writes `private.pem` (PKCS#8) and `public.pem` (SubjectPublicKeyInfo) to the current directory. On Unix platforms, the private key file is created or rewritten with `0600` permissions.
+Writes `private.pem` (PKCS#8) and `public.pem` (SubjectPublicKeyInfo) to the current directory. On Unix platforms, the private key file is created with `0600` permissions. The command refuses to overwrite existing key files; move them away or pass different paths to generate a new pair.
 
 Options:
 
@@ -97,6 +97,7 @@ Keep `private.pem` secret. Distribute `public.pem` to any system that needs to v
 ## Security Notes
 
 - On Unix, generated private keys are written with `0600` permissions. On non-Unix platforms, protect private keys with the host operating system's file access controls.
+- `generate-keys` never overwrites existing files, so a key pair cannot be destroyed by re-running the command.
 - The verifier uses the public key passed with `--public-key`; it does not perform key lookup from `kid`.
 - The `_signature.sig` field is the value that is verified. Treat `alg`, `kid`, and `signed_at` as metadata, not authorization decisions.
 - The project uses the RustCrypto `rsa` crate. `.cargo/audit.toml` currently ignores `RUSTSEC-2023-0071` because this is intended as a local CLI tool, not a network-exposed signing service. Revisit that exception before using this code in any service where attackers can trigger signing or observe timing.
