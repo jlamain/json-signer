@@ -161,7 +161,7 @@ fn canonicalize(m: &Map<String, Value>) -> Result<Vec<u8>> {
 }
 
 /// Sign the json file at `json_path` using the RSA private key at `private_key_path`, embedding the signature in the `_signature` field.
-fn sign_json(json_path: &PathBuf, private_key_path: &PathBuf, key_id: &str) -> Result<()> {
+fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<()> {
     // Load and parse config
     let raw = fs::read_to_string(json_path)
         .with_context(|| format!("Cannot read {}", json_path.display()))?;
@@ -237,7 +237,7 @@ fn verify_json(
 
 /// Verify the signature embedded in the JSON file at `json_path` using the RSA public key at `public_key_path`.
 /// Returns true if valid, false if invalid.
-fn load_and_verify_json(json_path: &PathBuf, public_key_path: &PathBuf) -> Result<bool> {
+fn load_and_verify_json(json_path: &Path, public_key_path: &Path) -> Result<bool> {
     // Load and parse config
     let raw = fs::read_to_string(json_path)
         .with_context(|| format!("Cannot read {}", json_path.display()))?;
@@ -572,7 +572,7 @@ mod tests {
         assert!(verify_json(&payload, pub_key, &sig_block).unwrap());
     }
 
-    /// generate_keys tests
+    /// `generate_keys` tests
     #[test]
     fn test_generate_keys_creates_pem_files() {
         let priv_path = temp_path("gen_priv.pem");
@@ -663,7 +663,7 @@ mod tests {
         let _ = fs::remove_file(&priv_path);
     }
 
-    /// load_and_verify_json tests    
+    /// `load_and_verify_json` tests    
     #[test]
     fn test_load_and_verify_json_valid_file_returns_true() {
         let (priv_key, pub_key) = make_test_key_pair();
@@ -725,7 +725,7 @@ mod tests {
         // _signature is a plain string, not an object.
         fs::write(
             &json_path,
-            format!(r#"{{"env":"prod","{}":"not-an-object"}}"#, SIGNATURE_FIELD),
+            format!(r#"{{"env":"prod","{SIGNATURE_FIELD}":"not-an-object"}}"#),
         )
         .unwrap();
         write_public_key_file(&pub_path, &pub_key);
