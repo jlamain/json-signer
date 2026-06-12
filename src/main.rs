@@ -14,10 +14,14 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use ed25519_dalek::{
+    Signature as Ed25519Signature, SigningKey as Ed25519SigningKey,
+    VerifyingKey as Ed25519VerifyingKey,
+};
 use pem::{encode as pem_encode, parse as pem_parse, Pem};
 use rand::rngs::OsRng;
 use rsa::{
-    pkcs1v15::{SigningKey, VerifyingKey},
+    pkcs1v15::{SigningKey as RsaSigningKey, VerifyingKey as RsaVerifyingKey},
     pkcs8::{DecodePrivateKey, EncodePrivateKey},
     RsaPrivateKey, RsaPublicKey,
 };
@@ -29,6 +33,20 @@ use spki::{DecodePublicKey, EncodePublicKey};
 const SIGNATURE_FIELD: &str = "_signature";
 const PRIVATE_KEY_TAG: &str = "PRIVATE KEY"; // PKCS#8
 const PUBLIC_KEY_TAG: &str = "PUBLIC KEY"; // SubjectPublicKeyInfo
+
+/// A private key loaded from a PKCS#8 PEM file, with the algorithm determined
+/// by the DER-encoded algorithm identifier rather than the PEM label (which
+/// is the same, "PRIVATE KEY", for both RSA and Ed25519).
+enum PrivateKey {
+    Rsa(RsaPrivateKey),
+    Ed25519(Ed25519SigningKey),
+}
+
+/// A public key loaded from a SubjectPublicKeyInfo PEM file. See `PrivateKey`.
+enum PublicKey {
+    Rsa(RsaPublicKey),
+    Ed25519(Ed25519VerifyingKey),
+}
 
 /// Clap derived command line parser. Commands can be generate-keys, sign, verify with appropriate arguments.
 #[derive(Parser)]
@@ -248,20 +266,38 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     })
 }
 
-/// Load an RSA private key from a PKCS#8 PEM file.
-fn load_private_key(path: &Path) -> Result<RsaPrivateKey> {
+/// Load a private key (RSA or Ed25519) from a PKCS#8 PEM file. The algorithm
+/// is determined by the DER-encoded algorithm identifier.
+fn load_private_key(path: &Path) -> Result<PrivateKey> {
     let pem_data =
         fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
     let pem = pem_parse(&pem_data).context("Failed to parse private key PEM")?;
-    RsaPrivateKey::from_pkcs8_der(pem.contents()).context("Failed to load private key")
+
+    if let Ok(key) = RsaPrivateKey::from_pkcs8_der(pem.contents()) {
+        return Ok(PrivateKey::Rsa(key));
+    }
+    if let Ok(key) = Ed25519SigningKey::from_pkcs8_der(pem.contents()) {
+        return Ok(PrivateKey::Ed25519(key));
+    }
+    bail!("Failed to load private key: unrecognized key type (expected RSA or Ed25519 PKCS#8)")
 }
 
-/// Load an RSA public key from a SubjectPublicKeyInfo PEM file.
-fn load_public_key(path: &Path) -> Result<RsaPublicKey> {
+/// Load a public key (RSA or Ed25519) from a SubjectPublicKeyInfo PEM file.
+/// The algorithm is determined by the DER-encoded algorithm identifier.
+fn load_public_key(path: &Path) -> Result<PublicKey> {
     let pem_data =
         fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
     let pem = pem_parse(&pem_data).context("Failed to parse public key PEM")?;
-    RsaPublicKey::from_public_key_der(pem.contents()).context("Failed to load public key")
+
+    if let Ok(key) = RsaPublicKey::from_public_key_der(pem.contents()) {
+        return Ok(PublicKey::Rsa(key));
+    }
+    if let Ok(key) = Ed25519VerifyingKey::from_public_key_der(pem.contents()) {
+        return Ok(PublicKey::Ed25519(key));
+    }
+    bail!(
+        "Failed to load public key: unrecognized key type (expected RSA or Ed25519 SubjectPublicKeyInfo)"
+    )
 }
 
 /// Sign the canonical form of `json` and insert the resulting `_signature` block,
@@ -269,24 +305,34 @@ fn load_public_key(path: &Path) -> Result<RsaPublicKey> {
 /// before signing, so it is covered by the signature; only `sig` itself is not.
 fn embed_signature(
     json: &mut Map<String, Value>,
-    private_key: RsaPrivateKey,
+    private_key: PrivateKey,
     key_id: &str,
     signed_at: &str,
 ) -> Result<()> {
+    let alg = match &private_key {
+        PrivateKey::Rsa(_) => "RS256",
+        PrivateKey::Ed25519(_) => "EdDSA",
+    };
     json.insert(
         SIGNATURE_FIELD.into(),
         serde_json::json!({
-            "alg":       "RS256",
+            "alg":       alg,
             "kid":       key_id,
             "signed_at": signed_at,
         }),
     );
     let payload = canonicalize(json)?;
 
-    let signing_key = SigningKey::<Sha256>::new(private_key);
-    // Sign (PKCS#1v15 is deterministic — no RNG needed at sign time)
-    let sig: rsa::pkcs1v15::Signature = signing_key.sign(&payload);
-    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes().as_ref());
+    let sig_bytes: Vec<u8> = match private_key {
+        PrivateKey::Rsa(key) => {
+            let signing_key = RsaSigningKey::<Sha256>::new(key);
+            // Sign (PKCS#1v15 is deterministic — no RNG needed at sign time)
+            let sig: rsa::pkcs1v15::Signature = signing_key.sign(&payload);
+            sig.to_bytes().to_vec()
+        }
+        PrivateKey::Ed25519(key) => key.sign(&payload).to_bytes().to_vec(),
+    };
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig_bytes);
 
     let Some(Value::Object(sig_block)) = json.get_mut(SIGNATURE_FIELD) else {
         unreachable!("signature block was just inserted as an object");
@@ -330,7 +376,7 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
 /// Returns `Ok(false)` for a well-formed signature that does not match, and `Err` for
 /// structurally invalid input: missing or non-object `_signature`, missing `sig`,
 /// bad base64, or a signature with an impossible length.
-fn verify_json(json: &Map<String, Value>, public_key: RsaPublicKey) -> Result<bool> {
+fn verify_json(json: &Map<String, Value>, public_key: PublicKey) -> Result<bool> {
     let Some(sig_block) = json.get(SIGNATURE_FIELD).and_then(|v| v.as_object()) else {
         bail!("No '{SIGNATURE_FIELD}' object found in config");
     };
@@ -346,12 +392,22 @@ fn verify_json(json: &Map<String, Value>, public_key: RsaPublicKey) -> Result<bo
 
     let payload = canonicalize(json)?;
 
-    let verifying_key = VerifyingKey::<Sha256>::new(public_key);
-
-    let signature = rsa::pkcs1v15::Signature::try_from(raw_sig.as_slice())
-        .context("Invalid signature bytes")?;
-
-    Ok(verifying_key.verify(&payload, &signature).is_ok())
+    match public_key {
+        PublicKey::Rsa(key) => {
+            let verifying_key = RsaVerifyingKey::<Sha256>::new(key);
+            let signature = rsa::pkcs1v15::Signature::try_from(raw_sig.as_slice())
+                .context("Invalid signature bytes")?;
+            Ok(verifying_key.verify(&payload, &signature).is_ok())
+        }
+        PublicKey::Ed25519(key) => {
+            let sig_bytes: [u8; 64] = raw_sig
+                .as_slice()
+                .try_into()
+                .context("Invalid signature bytes")?;
+            let signature = Ed25519Signature::from_bytes(&sig_bytes);
+            Ok(key.verify(&payload, &signature).is_ok())
+        }
+    }
 }
 
 /// Verify the signature embedded in the JSON file at `json_path` using the RSA public key at `public_key_path`.
@@ -419,10 +475,19 @@ mod tests {
     use std::{fs, path::PathBuf};
 
     // Use 1024-bit keys in tests for speed (2048 would be too slow for many test runs).
-    fn make_test_key_pair() -> (RsaPrivateKey, RsaPublicKey) {
+    fn make_test_key_pair() -> (PrivateKey, PublicKey) {
         let priv_key = RsaPrivateKey::new(&mut OsRng, 1024).unwrap();
         let pub_key = RsaPublicKey::from(&priv_key);
-        (priv_key, pub_key)
+        (PrivateKey::Rsa(priv_key), PublicKey::Rsa(pub_key))
+    }
+
+    fn make_test_key_pair_ed25519() -> (PrivateKey, PublicKey) {
+        let signing_key = Ed25519SigningKey::generate(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        (
+            PrivateKey::Ed25519(signing_key),
+            PublicKey::Ed25519(verifying_key),
+        )
     }
 
     fn canonicalize_ok(m: &Map<String, Value>) -> Vec<u8> {
@@ -438,7 +503,7 @@ mod tests {
     }
 
     // Return a copy of `payload` signed with fixed metadata, via the real signing path.
-    fn signed_map(priv_key: RsaPrivateKey, payload: &Map<String, Value>) -> Map<String, Value> {
+    fn signed_map(priv_key: PrivateKey, payload: &Map<String, Value>) -> Map<String, Value> {
         let mut m = payload.clone();
         embed_signature(&mut m, priv_key, "test-key", "2024-01-01T00:00:00Z").unwrap();
         m
@@ -456,25 +521,37 @@ mod tests {
         std::env::temp_dir().join(format!("json_signer_test__{label}"))
     }
 
-    fn write_public_key_file(path: &PathBuf, pub_key: &RsaPublicKey) {
-        let der = pub_key.to_public_key_der().unwrap();
-        let pem = pem_encode(&Pem::new(PUBLIC_KEY_TAG, der.as_bytes()));
+    fn write_public_key_file(path: &PathBuf, pub_key: &PublicKey) {
+        let pem = match pub_key {
+            PublicKey::Rsa(k) => {
+                let der = k.to_public_key_der().unwrap();
+                pem_encode(&Pem::new(PUBLIC_KEY_TAG, der.as_bytes()))
+            }
+            PublicKey::Ed25519(k) => {
+                let der = k.to_public_key_der().unwrap();
+                pem_encode(&Pem::new(PUBLIC_KEY_TAG, der.as_bytes()))
+            }
+        };
         fs::write(path, pem).unwrap();
     }
 
-    fn write_private_key_file(path: &PathBuf, priv_key: &RsaPrivateKey) {
-        let der = priv_key.to_pkcs8_der().unwrap();
-        let pem = pem_encode(&Pem::new(PRIVATE_KEY_TAG, der.as_bytes()));
+    fn write_private_key_file(path: &PathBuf, priv_key: &PrivateKey) {
+        let pem = match priv_key {
+            PrivateKey::Rsa(k) => {
+                let der = k.to_pkcs8_der().unwrap();
+                pem_encode(&Pem::new(PRIVATE_KEY_TAG, der.as_bytes()))
+            }
+            PrivateKey::Ed25519(k) => {
+                let der = k.to_pkcs8_der().unwrap();
+                pem_encode(&Pem::new(PRIVATE_KEY_TAG, der.as_bytes()))
+            }
+        };
         fs::write(path, pem).unwrap();
     }
 
     // Build and write a fully signed JSON file with in-process key material, using
     // the same embed_signature path as the sign command.
-    fn write_signed_json_file(
-        path: &PathBuf,
-        priv_key: RsaPrivateKey,
-        payload: &Map<String, Value>,
-    ) {
+    fn write_signed_json_file(path: &PathBuf, priv_key: PrivateKey, payload: &Map<String, Value>) {
         let mut full = payload.clone();
         embed_signature(&mut full, priv_key, "test-k1", "2024-01-01T00:00:00Z").unwrap();
         let out = serde_json::to_string_pretty(&Value::Object(full)).unwrap();
@@ -691,6 +768,69 @@ mod tests {
         assert!(verify_json(&signed, pub_key).unwrap());
     }
 
+    /// Ed25519 `verify_json` tests
+    #[test]
+    fn test_embed_signature_ed25519_sets_eddsa_alg() {
+        let (priv_key, _) = make_test_key_pair_ed25519();
+        let signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
+
+        assert_eq!(signed[SIGNATURE_FIELD]["alg"], json!("EdDSA"));
+    }
+
+    #[test]
+    fn test_verify_json_ed25519_valid_signature_returns_true() {
+        let (priv_key, pub_key) = make_test_key_pair_ed25519();
+        let signed = signed_map(
+            priv_key,
+            &make_map(&[("env", json!("prod")), ("v", json!(2))]),
+        );
+
+        assert!(verify_json(&signed, pub_key).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_ed25519_tampered_value_returns_false() {
+        let (priv_key, pub_key) = make_test_key_pair_ed25519();
+        let mut signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
+
+        signed.insert("env".into(), json!("dev"));
+
+        assert!(!verify_json(&signed, pub_key).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_ed25519_tampered_kid_returns_false() {
+        let (priv_key, pub_key) = make_test_key_pair_ed25519();
+        let mut signed = signed_map(priv_key, &make_map(&[("env", json!("prod"))]));
+
+        tamper_sig_block(&mut signed, "kid", json!("other-key"));
+
+        assert!(!verify_json(&signed, pub_key).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_ed25519_wrong_key_returns_false() {
+        let (priv_key, _) = make_test_key_pair_ed25519();
+        let (_, other_pub) = make_test_key_pair_ed25519();
+        let signed = signed_map(priv_key, &make_map(&[("x", json!(1))]));
+
+        assert!(!verify_json(&signed, other_pub).unwrap());
+    }
+
+    #[test]
+    fn test_verify_json_ed25519_truncated_signature_does_not_verify() {
+        let (_, pub_key) = make_test_key_pair_ed25519();
+        let mut payload = make_map(&[("x", json!(1))]);
+        // Valid base64, but not 64 bytes (the fixed Ed25519 signature length).
+        let bad_sig = URL_SAFE_NO_PAD.encode(b"way_too_short");
+        payload.insert(SIGNATURE_FIELD.into(), json!({ "sig": bad_sig }));
+
+        match verify_json(&payload, pub_key) {
+            Ok(false) | Err(_) => {} // invalid bytes must not produce Ok(true)
+            Ok(true) => panic!("truncated signature must not verify"),
+        }
+    }
+
     /// `generate_keys` tests
     #[test]
     fn test_generate_keys_creates_pem_files() {
@@ -826,6 +966,28 @@ mod tests {
         let signed: Value = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
         assert_eq!(signed[SIGNATURE_FIELD]["kid"], json!("rt-key"));
         assert_eq!(signed["env"], json!("prod"));
+
+        let _ = fs::remove_file(&json_path);
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+    }
+
+    #[test]
+    fn test_sign_json_round_trips_with_ed25519_key() {
+        let (priv_key, pub_key) = make_test_key_pair_ed25519();
+        let json_path = temp_path("sign_rt_ed25519.json");
+        let priv_path = temp_path("sign_rt_ed25519_priv.pem");
+        let pub_path = temp_path("sign_rt_ed25519_pub.pem");
+
+        fs::write(&json_path, r#"{"env":"prod","version":1}"#).unwrap();
+        write_private_key_file(&priv_path, &priv_key);
+        write_public_key_file(&pub_path, &pub_key);
+
+        sign_json(&json_path, &priv_path, "rt-key").unwrap();
+        assert!(load_and_verify_json(&json_path, &pub_path).unwrap());
+
+        let signed: Value = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(signed[SIGNATURE_FIELD]["alg"], json!("EdDSA"));
 
         let _ = fs::remove_file(&json_path);
         let _ = fs::remove_file(&priv_path);
