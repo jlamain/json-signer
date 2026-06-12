@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap        = { version = "4.6", features = ["derive"] }
+ed25519-dalek = { version = "2", features = ["pkcs8", "rand_core"] }
 rsa         = { version = "0.9", features = ["sha2"] }
 sha2        = "0.10"
 rand        = "0.8"
