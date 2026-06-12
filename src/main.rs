@@ -165,6 +165,79 @@ fn write_private_key_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     file.write_all(contents)
 }
 
+/// Recursive serde visitor that accepts any JSON value but fails on duplicate object
+/// keys at any nesting level. `serde_json` silently keeps the last duplicate, so two
+/// parsers can disagree about a signed document's content; RFC 8785 assumes unique
+/// keys (I-JSON), so such input must be rejected rather than signed or verified.
+struct RejectDuplicateKeys;
+
+impl<'de> serde::de::DeserializeSeed<'de> for RejectDuplicateKeys {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RejectDuplicateKeys {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, _: bool) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _: &str) -> Result<(), E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<(), E> {
+        Ok(())
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        while seq.next_element_seed(RejectDuplicateKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let mut seen = std::collections::HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate object key '{key}'"
+                )));
+            }
+            map.next_value_seed(RejectDuplicateKeys)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse `raw` as a top-level JSON object, rejecting duplicate object keys anywhere
+/// in the document.
+fn parse_json_object(raw: &str) -> Result<Map<String, Value>> {
+    let json: Map<String, Value> = serde_json::from_str(raw).context("Config is not valid JSON")?;
+
+    use serde::de::DeserializeSeed as _;
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    RejectDuplicateKeys
+        .deserialize(&mut deserializer)
+        .context("Config contains duplicate object keys")?;
+
+    Ok(json)
+}
+
 /// Write `contents` to `path` atomically: write a sibling temp file, then rename it
 /// over the target, so a crash mid-write cannot leave a truncated file behind.
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
@@ -237,8 +310,7 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
     // Load and parse config
     let raw = fs::read_to_string(json_path)
         .with_context(|| format!("Cannot read {}", json_path.display()))?;
-    let mut json: Map<String, Value> =
-        serde_json::from_str(&raw).context("Config is not valid JSON")?;
+    let mut json = parse_json_object(&raw)?;
 
     if json.contains_key(SIGNATURE_FIELD) {
         println!("Existing signature found — replacing it.");
@@ -289,8 +361,7 @@ fn load_and_verify_json(json_path: &Path, public_key_path: &Path) -> Result<bool
     // Load and parse config
     let raw = fs::read_to_string(json_path)
         .with_context(|| format!("Cannot read {}", json_path.display()))?;
-    let json: Map<String, Value> =
-        serde_json::from_str(&raw).context("Config is not valid JSON")?;
+    let json = parse_json_object(&raw)?;
 
     let public_key = load_public_key(public_key_path)?;
 
@@ -771,6 +842,79 @@ mod tests {
 
         let _ = fs::remove_file(&json_path);
         let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+    }
+
+    /// `parse_json_object` tests
+    #[test]
+    fn test_parse_json_object_accepts_unique_keys() {
+        let m = parse_json_object(r#"{"a":1,"b":{"c":2}}"#).unwrap();
+        assert_eq!(m["a"], json!(1));
+    }
+
+    #[test]
+    fn test_parse_json_object_rejects_top_level_duplicate_keys() {
+        let err = parse_json_object(r#"{"env":"prod","env":"dev"}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_parse_json_object_rejects_nested_duplicate_keys() {
+        let err = parse_json_object(r#"{"cfg":{"host":"a","host":"b"}}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_parse_json_object_rejects_duplicates_inside_arrays() {
+        let err = parse_json_object(r#"{"list":[{"k":1,"k":2}]}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn test_parse_json_object_rejects_non_object_top_level() {
+        assert!(parse_json_object("[1,2,3]").is_err());
+    }
+
+    #[test]
+    fn test_sign_json_rejects_duplicate_keys() {
+        let (priv_key, _) = make_test_key_pair();
+        let json_path = temp_path("sign_dup.json");
+        let priv_path = temp_path("sign_dup_priv.pem");
+
+        fs::write(&json_path, r#"{"env":"prod","env":"dev"}"#).unwrap();
+        write_private_key_file(&priv_path, &priv_key);
+
+        let err = sign_json(&json_path, &priv_path, "k").unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+
+        let _ = fs::remove_file(&json_path);
+        let _ = fs::remove_file(&priv_path);
+    }
+
+    #[test]
+    fn test_load_and_verify_json_rejects_duplicate_keys() {
+        let (priv_key, pub_key) = make_test_key_pair();
+        let json_path = temp_path("lv_dup.json");
+        let pub_path = temp_path("lv_dup_pub.pem");
+
+        // Sign a clean file, then inject a duplicate key into the raw text.
+        let payload = make_map(&[("env", json!("prod"))]);
+        write_signed_json_file(&json_path, priv_key, &payload);
+        write_public_key_file(&pub_path, &pub_key);
+
+        let raw = fs::read_to_string(&json_path).unwrap();
+        let tampered = raw.replacen(
+            "\"env\": \"prod\"",
+            "\"env\": \"dev\",\n  \"env\": \"prod\"",
+            1,
+        );
+        assert_ne!(raw, tampered, "test setup must inject a duplicate key");
+        fs::write(&json_path, tampered).unwrap();
+
+        let err = load_and_verify_json(&json_path, &pub_path).unwrap_err();
+        assert!(err.to_string().contains("duplicate"));
+
+        let _ = fs::remove_file(&json_path);
         let _ = fs::remove_file(&pub_path);
     }
 
