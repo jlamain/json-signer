@@ -48,11 +48,19 @@ enum PublicKey {
     Ed25519(Ed25519VerifyingKey),
 }
 
+/// Key algorithm to generate. Ed25519 is the default: it is faster, has
+/// smaller keys, and is the modern recommendation over RSA-2048.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Algorithm {
+    Ed25519,
+    Rsa2048,
+}
+
 /// Clap derived command line parser. Commands can be generate-keys, sign, verify with appropriate arguments.
 #[derive(Parser)]
 #[command(
     name = "json-config-signer",
-    about = "Sign and verify JSON config files (RSA-2048/PKCS#1v15/SHA-256 + RFC 8785)",
+    about = "Sign and verify JSON config files (Ed25519 or RSA-2048/PKCS#1v15/SHA-256 + RFC 8785)",
     version
 )]
 struct Cli {
@@ -62,7 +70,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate a new RSA-2048 key pair (PKCS#8 PEM)
+    /// Generate a new key pair (PKCS#8 PEM)
     GenerateKeys {
         #[arg(
             long,
@@ -77,6 +85,14 @@ enum Command {
             help = "Output path for the public key"
         )]
         public_key: PathBuf,
+
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = Algorithm::Ed25519,
+            help = "Key algorithm to generate"
+        )]
+        algorithm: Algorithm,
     },
 
     /// Sign a JSON config file in-place (adds/replaces the _signature field)
@@ -116,7 +132,7 @@ enum Command {
 // Key generation and export functions. Keys are generated as RSA-2048, exported in PKCS#8 (private)
 // and SubjectPublicKeyInfo (public) DER format, then PEM-encoded for storage.
 
-fn generate_keys(private_key_path: &Path, public_key_path: &Path) -> Result<()> {
+fn generate_keys(private_key_path: &Path, public_key_path: &Path, algorithm: Algorithm) -> Result<()> {
     // Never clobber existing key material; a lost private key is unrecoverable.
     for path in [private_key_path, public_key_path] {
         if path.exists() {
@@ -127,21 +143,38 @@ fn generate_keys(private_key_path: &Path, public_key_path: &Path) -> Result<()> 
         }
     }
 
-    let private_key = RsaPrivateKey::new(&mut OsRng, 2048).context("Key generation failed")?;
-    let public_key = RsaPublicKey::from(&private_key);
+    let (private_der, public_der) = match algorithm {
+        Algorithm::Rsa2048 => {
+            let private_key =
+                RsaPrivateKey::new(&mut OsRng, 2048).context("Key generation failed")?;
+            let public_key = RsaPublicKey::from(&private_key);
+            (
+                private_key
+                    .to_pkcs8_der()
+                    .context("Failed to export private key")?,
+                public_key
+                    .to_public_key_der()
+                    .context("Failed to export public key")?,
+            )
+        }
+        Algorithm::Ed25519 => {
+            let signing_key = Ed25519SigningKey::generate(&mut OsRng);
+            let verifying_key = signing_key.verifying_key();
+            (
+                signing_key
+                    .to_pkcs8_der()
+                    .context("Failed to export private key")?,
+                verifying_key
+                    .to_public_key_der()
+                    .context("Failed to export public key")?,
+            )
+        }
+    };
 
-    // Private key → PKCS#8 DER → PEM
-    let private_der = private_key
-        .to_pkcs8_der()
-        .context("Failed to export private key")?;
     let private_pem = pem_encode(&Pem::new(PRIVATE_KEY_TAG, private_der.as_bytes()));
     write_private_key(private_key_path, &private_pem)
         .with_context(|| format!("Cannot write {}", private_key_path.display()))?;
 
-    // Public key → SubjectPublicKeyInfo DER → PEM
-    let public_der = public_key
-        .to_public_key_der()
-        .context("Failed to export public key")?;
     let public_pem = pem_encode(&Pem::new(PUBLIC_KEY_TAG, public_der.as_bytes()));
     fs::write(public_key_path, &public_pem)
         .with_context(|| format!("Cannot write {}", public_key_path.display()))?;
@@ -431,8 +464,9 @@ fn main() -> Result<()> {
         Command::GenerateKeys {
             private_key,
             public_key,
+            algorithm,
         } => {
-            generate_keys(private_key, public_key)?;
+            generate_keys(private_key, public_key, *algorithm)?;
             println!(
                 "Keys written to: {}  {}",
                 private_key.display(),
@@ -839,7 +873,28 @@ mod tests {
         let _ = fs::remove_file(&priv_path);
         let _ = fs::remove_file(&pub_path);
 
-        generate_keys(&priv_path, &pub_path).unwrap();
+        generate_keys(&priv_path, &pub_path, Algorithm::Rsa2048).unwrap();
+
+        assert!(priv_path.exists(), "private key file should exist");
+        assert!(pub_path.exists(), "public key file should exist");
+
+        let priv_pem = fs::read_to_string(&priv_path).unwrap();
+        let pub_pem = fs::read_to_string(&pub_path).unwrap();
+        assert!(priv_pem.contains("PRIVATE KEY"));
+        assert!(pub_pem.contains("PUBLIC KEY"));
+
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+    }
+
+    #[test]
+    fn test_generate_keys_creates_pem_files_ed25519() {
+        let priv_path = temp_path("gen_priv_ed25519.pem");
+        let pub_path = temp_path("gen_pub_ed25519.pem");
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+
+        generate_keys(&priv_path, &pub_path, Algorithm::Ed25519).unwrap();
 
         assert!(priv_path.exists(), "private key file should exist");
         assert!(pub_path.exists(), "public key file should exist");
@@ -863,7 +918,7 @@ mod tests {
         let _ = fs::remove_file(&priv_path);
         let _ = fs::remove_file(&pub_path);
 
-        generate_keys(&priv_path, &pub_path).unwrap();
+        generate_keys(&priv_path, &pub_path, Algorithm::Ed25519).unwrap();
 
         let mode = fs::metadata(&priv_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "private key file should be owner-only");
@@ -879,7 +934,7 @@ mod tests {
         let _ = fs::remove_file(&priv_path);
         let _ = fs::remove_file(&pub_path);
 
-        generate_keys(&priv_path, &pub_path).unwrap();
+        generate_keys(&priv_path, &pub_path, Algorithm::Rsa2048).unwrap();
 
         let priv_pem_data = fs::read_to_string(&priv_path).unwrap();
         let pub_pem_data = fs::read_to_string(&pub_path).unwrap();
@@ -901,11 +956,37 @@ mod tests {
     }
 
     #[test]
+    fn test_generate_keys_produces_parseable_and_matching_pair_ed25519() {
+        let priv_path = temp_path("pair_priv_ed25519.pem");
+        let pub_path = temp_path("pair_pub_ed25519.pem");
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+
+        generate_keys(&priv_path, &pub_path, Algorithm::Ed25519).unwrap();
+
+        let priv_pem_data = fs::read_to_string(&priv_path).unwrap();
+        let pub_pem_data = fs::read_to_string(&pub_path).unwrap();
+
+        let priv_parsed = pem::parse(&priv_pem_data).unwrap();
+        let pub_parsed = pem::parse(&pub_pem_data).unwrap();
+
+        let priv_key = Ed25519SigningKey::from_pkcs8_der(priv_parsed.contents()).unwrap();
+        let pub_key = Ed25519VerifyingKey::from_public_key_der(pub_parsed.contents()).unwrap();
+
+        let payload = b"round-trip-test";
+        let sig = priv_key.sign(payload);
+        assert!(pub_key.verify(payload, &sig).is_ok());
+
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+    }
+
+    #[test]
     fn test_generate_keys_invalid_private_key_path_is_error() {
         let bad_priv = PathBuf::from("/nonexistent_dir_abc123/private.pem");
         let pub_path = temp_path("dummy_pub_for_bad_priv.pem");
 
-        let result = generate_keys(&bad_priv, &pub_path);
+        let result = generate_keys(&bad_priv, &pub_path, Algorithm::Ed25519);
 
         assert!(result.is_err());
         let _ = fs::remove_file(&pub_path);
@@ -916,7 +997,7 @@ mod tests {
         let priv_path = temp_path("dummy_priv_for_bad_pub.pem");
         let bad_pub = PathBuf::from("/nonexistent_dir_abc123/public.pem");
 
-        let result = generate_keys(&priv_path, &bad_pub);
+        let result = generate_keys(&priv_path, &bad_pub, Algorithm::Ed25519);
 
         assert!(result.is_err());
         let _ = fs::remove_file(&priv_path);
@@ -929,10 +1010,10 @@ mod tests {
         let _ = fs::remove_file(&priv_path);
         let _ = fs::remove_file(&pub_path);
 
-        generate_keys(&priv_path, &pub_path).unwrap();
+        generate_keys(&priv_path, &pub_path, Algorithm::Ed25519).unwrap();
         let original_priv = fs::read_to_string(&priv_path).unwrap();
 
-        let err = generate_keys(&priv_path, &pub_path).unwrap_err();
+        let err = generate_keys(&priv_path, &pub_path, Algorithm::Ed25519).unwrap_err();
         assert!(err.to_string().contains("Refusing to overwrite"));
         assert_eq!(
             fs::read_to_string(&priv_path).unwrap(),
