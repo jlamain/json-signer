@@ -150,6 +150,50 @@ fn write_private_key_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     fs::write(path, contents)
 }
 
+/// Load an RSA private key from a PKCS#8 PEM file.
+fn load_private_key(path: &Path) -> Result<RsaPrivateKey> {
+    let pem_data =
+        fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    let pem = pem_parse(&pem_data).context("Failed to parse private key PEM")?;
+    RsaPrivateKey::from_pkcs8_der(pem.contents()).context("Failed to load private key")
+}
+
+/// Load an RSA public key from a SubjectPublicKeyInfo PEM file.
+fn load_public_key(path: &Path) -> Result<RsaPublicKey> {
+    let pem_data =
+        fs::read_to_string(path).with_context(|| format!("Cannot read {}", path.display()))?;
+    let pem = pem_parse(&pem_data).context("Failed to parse public key PEM")?;
+    RsaPublicKey::from_public_key_der(pem.contents()).context("Failed to load public key")
+}
+
+/// Sign the canonical form of `json` and insert the resulting `_signature` block,
+/// replacing any existing one.
+fn embed_signature(
+    json: &mut Map<String, Value>,
+    private_key: RsaPrivateKey,
+    key_id: &str,
+    signed_at: &str,
+) -> Result<()> {
+    json.remove(SIGNATURE_FIELD);
+    let payload = canonicalize(json)?;
+
+    let signing_key = SigningKey::<Sha256>::new(private_key);
+    // Sign (PKCS#1v15 is deterministic — no RNG needed at sign time)
+    let sig: rsa::pkcs1v15::Signature = signing_key.sign(&payload);
+    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes().as_ref());
+
+    json.insert(
+        SIGNATURE_FIELD.into(),
+        serde_json::json!({
+            "alg":       "RS256",
+            "kid":       key_id,
+            "signed_at": signed_at,
+            "sig":       sig_b64,
+        }),
+    );
+    Ok(())
+}
+
 /// Return the canonical JSON bytes of Map `m`, with `_signature` stripped.
 fn canonicalize(m: &Map<String, Value>) -> Result<Vec<u8>> {
     let without_sig: Map<String, Value> = m
@@ -170,34 +214,10 @@ fn sign_json(json_path: &Path, private_key_path: &Path, key_id: &str) -> Result<
 
     if json.contains_key(SIGNATURE_FIELD) {
         println!("Existing signature found — replacing it.");
-        json.remove(SIGNATURE_FIELD);
     }
 
-    // Build canonical payload
-    let payload = canonicalize(&json)?;
-
-    // Load private key from PKCS#8 PEM
-    let pem_data = fs::read_to_string(private_key_path)
-        .with_context(|| format!("Cannot read {}", private_key_path.display()))?;
-    let pem = pem_parse(&pem_data).context("Failed to parse private key PEM")?;
-    let private_key =
-        RsaPrivateKey::from_pkcs8_der(pem.contents()).context("Failed to load private key")?;
-    let signing_key = SigningKey::<Sha256>::new(private_key);
-
-    // Sign (PKCS#1v15 is deterministic — no RNG needed at sign time)
-    let sig: rsa::pkcs1v15::Signature = signing_key.sign(&payload);
-    let sig_b64 = URL_SAFE_NO_PAD.encode(sig.to_bytes().as_ref());
-
-    // Embed signature
-    json.insert(
-        SIGNATURE_FIELD.into(),
-        serde_json::json!({
-            "alg":       "RS256",
-            "kid":       key_id,
-            "signed_at": Utc::now().to_rfc3339(),
-            "sig":       sig_b64,
-        }),
-    );
+    let private_key = load_private_key(private_key_path)?;
+    embed_signature(&mut json, private_key, key_id, &Utc::now().to_rfc3339())?;
 
     let output =
         serde_json::to_string_pretty(&Value::Object(json)).context("Serialization failed")?;
@@ -244,12 +264,7 @@ fn load_and_verify_json(json_path: &Path, public_key_path: &Path) -> Result<bool
     let json: Map<String, Value> =
         serde_json::from_str(&raw).context("Config is not valid JSON")?;
 
-    // Load public key from SubjectPublicKeyInfo PEM
-    let pem_data = fs::read_to_string(public_key_path)
-        .with_context(|| format!("Cannot read {}", public_key_path.display()))?;
-    let pem = pem_parse(&pem_data).context("Failed to parse public key PEM")?;
-    let public_key =
-        RsaPublicKey::from_public_key_der(pem.contents()).context("Failed to load public key")?;
+    let public_key = load_public_key(public_key_path)?;
 
     let Some(sig_block) = json.get(SIGNATURE_FIELD).and_then(|v| v.as_object()) else {
         bail!("No '{SIGNATURE_FIELD}' field found in config");
@@ -351,25 +366,21 @@ mod tests {
         fs::write(path, pem).unwrap();
     }
 
-    // Build and write a fully signed JSON file using in-process key material so the
-    // load_and_verify_json tests do not depend on the sign_json CLI path.
+    fn write_private_key_file(path: &PathBuf, priv_key: &RsaPrivateKey) {
+        let der = priv_key.to_pkcs8_der().unwrap();
+        let pem = pem_encode(&Pem::new(PRIVATE_KEY_TAG, der.as_bytes()));
+        fs::write(path, pem).unwrap();
+    }
+
+    // Build and write a fully signed JSON file with in-process key material, using
+    // the same embed_signature path as the sign command.
     fn write_signed_json_file(
         path: &PathBuf,
         priv_key: RsaPrivateKey,
         payload: &Map<String, Value>,
     ) {
-        let canonical = canonicalize_ok(payload);
-        let sig_b64 = sign_bytes(&canonical, priv_key);
         let mut full = payload.clone();
-        full.insert(
-            SIGNATURE_FIELD.into(),
-            json!({
-                "alg":       "RS256",
-                "kid":       "test-k1",
-                "signed_at": "2024-01-01T00:00:00Z",
-                "sig":       sig_b64,
-            }),
-        );
+        embed_signature(&mut full, priv_key, "test-k1", "2024-01-01T00:00:00Z").unwrap();
         let out = serde_json::to_string_pretty(&Value::Object(full)).unwrap();
         fs::write(path, out).unwrap();
     }
@@ -663,7 +674,53 @@ mod tests {
         let _ = fs::remove_file(&priv_path);
     }
 
-    /// `load_and_verify_json` tests    
+    /// `sign_json` tests
+    #[test]
+    fn test_sign_json_round_trips_with_load_and_verify() {
+        let (priv_key, pub_key) = make_test_key_pair();
+        let json_path = temp_path("sign_rt.json");
+        let priv_path = temp_path("sign_rt_priv.pem");
+        let pub_path = temp_path("sign_rt_pub.pem");
+
+        fs::write(&json_path, r#"{"env":"prod","version":1}"#).unwrap();
+        write_private_key_file(&priv_path, &priv_key);
+        write_public_key_file(&pub_path, &pub_key);
+
+        sign_json(&json_path, &priv_path, "rt-key").unwrap();
+        assert!(load_and_verify_json(&json_path, &pub_path).unwrap());
+
+        let signed: Value = serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(signed[SIGNATURE_FIELD]["kid"], json!("rt-key"));
+        assert_eq!(signed["env"], json!("prod"));
+
+        let _ = fs::remove_file(&json_path);
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+    }
+
+    #[test]
+    fn test_sign_json_replaces_existing_signature() {
+        let (priv_key, pub_key) = make_test_key_pair();
+        let json_path = temp_path("sign_resign.json");
+        let priv_path = temp_path("sign_resign_priv.pem");
+        let pub_path = temp_path("sign_resign_pub.pem");
+
+        // Start with a file signed by a different (throwaway) key.
+        let (old_priv, _) = make_test_key_pair();
+        let payload = make_map(&[("env", json!("prod"))]);
+        write_signed_json_file(&json_path, old_priv, &payload);
+        write_private_key_file(&priv_path, &priv_key);
+        write_public_key_file(&pub_path, &pub_key);
+
+        sign_json(&json_path, &priv_path, "new-key").unwrap();
+        assert!(load_and_verify_json(&json_path, &pub_path).unwrap());
+
+        let _ = fs::remove_file(&json_path);
+        let _ = fs::remove_file(&priv_path);
+        let _ = fs::remove_file(&pub_path);
+    }
+
+    /// `load_and_verify_json` tests
     #[test]
     fn test_load_and_verify_json_valid_file_returns_true() {
         let (priv_key, pub_key) = make_test_key_pair();
